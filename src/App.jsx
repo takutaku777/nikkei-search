@@ -12,11 +12,11 @@
  *   [fix] 日本語テキストのフォントを sans-serif に変更（数値・コードは monospace 維持）
  *   [fix] モバイル スクロール中も進捗がわかるトーストバナーを追加
  *   [fix] ソートの初回クリックを常に降順（高い順）に統一
- * v1.3.1 (2026-02-19) CORSプロキシ障害対応
- *   [fix] 複数プロキシへの自動フォールバック（3種類を順番に試行）
- *   [fix] プロキシごとに8秒タイムアウトを設定
- *   [fix] 接続試行中のプロキシ名をUIに表示
- *   [fix] 全プロキシ失敗時に具体的な対処法を表示
+ * v1.3.1 (2026-02-19) CORSプロキシ障害対応（複数プロキシへの自動フォールバック）
+ * v1.3.2 (2026-02-20) Vercelデプロイ対応
+ *   [fix] 外部CORSプロキシを廃止し、Vercel APIルート（/api/yahoo）に切替
+ *   [fix] サーバーサイド取得によりCORS問題を根本解決
+ *   [fix] 開発環境（localhost）では従来のフォールバックプロキシを使用
  * ============================================================
  */
 
@@ -27,14 +27,20 @@ import {
 } from "recharts";
 
 // ── 定数 ────────────────────────────────────────────────────
-const VERSION    = "v1.3.1";
+const VERSION    = "v1.3.2";
 const BENCHMARK  = "1321.T";
 const BREAKPOINT = 768;
 
-// [v1.3.1] 複数CORSプロキシ定義（上から順に試行）
-// type: "wrap"  → レスポンスが { contents: "<json文字列>" } 形式
-// type: "direct"→ レスポンスが Yahoo Finance JSON そのもの
-const CORS_PROXIES = [
+// [v1.3.2] データ取得戦略
+// Vercel本番環境 → /api/yahoo（サーバーサイド取得、CORS問題なし）
+// localhost開発環境 → 外部CORSプロキシにフォールバック
+const IS_VERCEL = typeof window !== "undefined" &&
+  !window.location.hostname.includes("localhost") &&
+  !window.location.hostname.includes("127.0.0.1") &&
+  !window.location.hostname.includes("claude.ai");
+
+// 開発環境用フォールバックプロキシ（Vercel環境では使われない）
+const FALLBACK_PROXIES = [
   {
     name: "allorigins",
     build: (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
@@ -43,11 +49,6 @@ const CORS_PROXIES = [
   {
     name: "corsproxy.io",
     build: (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    parse: async (res) => res.json(),
-  },
-  {
-    name: "codetabs",
-    build: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
     parse: async (res) => res.json(),
   },
 ];
@@ -122,7 +123,7 @@ function useIsMobile() {
 // ── ユーティリティ ───────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// [v1.3.1] タイムアウト付き fetch
+// タイムアウト付き fetch
 async function fetchWithTimeout(url, timeoutMs = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -136,13 +137,30 @@ async function fetchWithTimeout(url, timeoutMs = 8000) {
   }
 }
 
-// [v1.3.1] 複数プロキシを順番に試行、成功したプロキシ名も返す
-// onProxyAttempt(proxyName) で試行中のプロキシ名を呼び出し元に通知
+// [v1.3.2] データ取得：Vercel本番 vs 開発環境で分岐
 async function fetchReturns(ticker, range, onProxyAttempt) {
+  if (IS_VERCEL) {
+    // ── 本番（Vercel）: サーバーサイドAPIルートを使用 ──
+    if (onProxyAttempt) onProxyAttempt("vercel/api");
+    const res = await fetchWithTimeout(
+      `/api/yahoo?ticker=${encodeURIComponent(ticker)}&range=${encodeURIComponent(range)}`
+    );
+    if (!res.ok) throw new Error(`API エラー: HTTP ${res.status}`);
+    const data = await res.json();
+    const closes     = data.chart.result[0].indicators.quote[0].close;
+    const timestamps = data.chart.result[0].timestamp;
+    const returns = {};
+    for (let i = 1; i < closes.length; i++) {
+      if (closes[i] != null && closes[i - 1] != null)
+        returns[timestamps[i]] = (closes[i] - closes[i - 1]) / closes[i - 1];
+    }
+    return returns;
+  }
+
+  // ── 開発環境: 外部CORSプロキシにフォールバック ──
   const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=${range}`;
   let lastError = null;
-
-  for (const proxy of CORS_PROXIES) {
+  for (const proxy of FALLBACK_PROXIES) {
     try {
       if (onProxyAttempt) onProxyAttempt(proxy.name);
       const res  = await fetchWithTimeout(proxy.build(yahooUrl));
@@ -155,13 +173,11 @@ async function fetchReturns(ticker, range, onProxyAttempt) {
         if (closes[i] != null && closes[i - 1] != null)
           returns[timestamps[i]] = (closes[i] - closes[i - 1]) / closes[i - 1];
       }
-      return returns; // 成功
+      return returns;
     } catch (e) {
       lastError = e;
-      // 次のプロキシへ
     }
   }
-  // 全プロキシ失敗
   throw new Error(`全プロキシ失敗: ${lastError?.message}`);
 }
 
@@ -354,11 +370,11 @@ export default function App() {
           : `完了 — ${found.length} 銘柄を計算しました`
       );
     } catch (e) {
+      const isVercelErr = IS_VERCEL;
       setError(
-        "3つのプロキシすべてに接続できませんでした。\n" +
-        "① Wi-Fi に切り替えてから再試行してください\n" +
-        "② それでも失敗する場合は、VPN をオフにして試してください\n" +
-        "③ しばらく時間をおいて再度お試しください"
+        isVercelErr
+          ? "データ取得に失敗しました。\n① /api/yahoo.js がデプロイされているか確認してください\n② Vercel のデプロイログでエラーを確認してください\n③ しばらく時間をおいて再試行してください"
+          : "3つのプロキシすべてに接続できませんでした。\n① Wi-Fi に切り替えてから再試行してください\n② それでも失敗する場合は、VPN をオフにして試してください\n③ しばらく時間をおいて再度お試しください"
       );
       setStatus("");
     } finally {
